@@ -1,0 +1,38 @@
+# Virtual environment
+venv/
+.venv/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Uploaded documents
+storage/documents/
+
+# Environment and OS files
+.DS_Store
+Thumbs.db
+
+# Local database and email testing files
+studyvault.session.sql
+test_email.py
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+*.log
