@@ -5,24 +5,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.core.config import settings
 from app.db.database import engine
 from app.routers.auth import router as auth_router
 from app.routers.documents import router as documents_router
 from app.routers.subjects import router as subjects_router
+from app.core.config import settings
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings.storage_path.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
     yield
-
     engine.dispose()
-
 
 app = FastAPI(
     title=settings.app_name,

@@ -1,23 +1,19 @@
-from pathlib import Path
-
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.models.file_deletion_task import FileDeletionTask
+from app.services.storage_service import delete_file
 
 
 def retry_file_deletions(db: Session) -> dict[str, int]:
     """
-    Retry pending file deletions.
+    Retry pending Backblaze B2 object deletions.
 
-    Only files inside the configured storage directory may be deleted.
     Failed tasks remain in the database for future retries.
     """
-    storage_root = settings.storage_path.resolve()
-
     tasks = (
         db.query(FileDeletionTask)
         .order_by(FileDeletionTask.created_at.asc())
+        .limit(100)
         .all()
     )
 
@@ -26,17 +22,10 @@ def retry_file_deletions(db: Session) -> dict[str, int]:
 
     for task in tasks:
         task_id = task.id
+        object_key = task.file_path
 
         try:
-            file_path = Path(task.file_path).resolve()
-
-            # Reject paths outside the configured storage directory.
-            if not file_path.is_relative_to(storage_root):
-                raise ValueError(
-                    "File path is outside the configured storage directory."
-                )
-
-            file_path.unlink(missing_ok=True)
+            delete_file(object_key)
 
             db.delete(task)
             db.commit()
@@ -45,7 +34,6 @@ def retry_file_deletions(db: Session) -> dict[str, int]:
         except Exception as exc:
             db.rollback()
 
-            # Record the failure if the task still exists.
             try:
                 pending_task = (
                     db.query(FileDeletionTask)

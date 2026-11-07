@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.main import app
 
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -39,8 +40,6 @@ TestingSessionLocal = sessionmaker(
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     Base.metadata.create_all(bind=test_engine)
-
-    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
 
     def override_get_db():
         db = TestingSessionLocal()
@@ -482,9 +481,25 @@ def test_upload_rejects_file_over_size_limit(client, monkeypatch):
     assert response.status_code == 400
     assert "exceeds" in response.json()["detail"].lower()
 
+def test_failed_upload_does_not_upload_to_b2(client, monkeypatch):
+    from app.services import document_service
 
-def test_failed_upload_does_not_leave_file(client, monkeypatch, tmp_path):
-    headers = register_and_login(client, "cleanup@example.com", monkeypatch)
+    headers = register_and_login(
+        client,
+        "cleanup@example.com",
+        monkeypatch,
+    )
+
+    upload_calls = []
+
+    def track_upload(file_object, object_key, content_type):
+        upload_calls.append(object_key)
+
+    monkeypatch.setattr(
+        document_service,
+        "upload_file",
+        track_upload,
+    )
 
     response = client.post(
         "/documents/",
@@ -500,90 +515,170 @@ def test_failed_upload_does_not_leave_file(client, monkeypatch, tmp_path):
     )
 
     assert response.status_code == 400
+    assert "valid PDF signature" in response.json()["detail"]
+    assert upload_calls == []
 
-    # No files should remain after the failed upload.
-    stored_files = list(tmp_path.rglob("*.pdf"))
-    assert stored_files == []
+def test_download_document_file(client, monkeypatch):
+    from app.routers import documents as documents_router
 
-def test_failed_file_deletion_can_be_retried(client, monkeypatch):
-    from app.services import document_service
+    headers = register_and_login(
+        client,
+        "download@example.com",
+        monkeypatch,
+    )
 
-    headers = register_and_login(client, "cleanup@example.com", monkeypatch)
-
-    # Upload a valid PDF.
     pdf_content = b"%PDF-1.4\nTest PDF content\n%%EOF"
-    response = client.post(
+
+    upload_response = client.post(
         "/documents/",
         headers=headers,
-        data={"title": "Cleanup test"},
+        data={"title": "Download test"},
         files={
             "file": (
-                "cleanup.pdf",
+                "download.pdf",
                 pdf_content,
                 "application/pdf",
             )
         },
     )
 
-    assert response.status_code == 201, response.text
-    document_id = response.json()["id"]
+    assert upload_response.status_code == 201
+    document_id = upload_response.json()["id"]
 
-    db = TestingSessionLocal()
+    class FakeFileBody:
+        def __init__(self, content):
+            self.content = content
 
-    try:
-        document = db.query(Document).filter_by(id=document_id).first()
-        assert document is not None
+        def read(self, size=-1):
+            if not self.content:
+                return b""
 
-        file_path = Path(document.file_path)
-        assert file_path.exists()
+            chunk = self.content[:size]
+            self.content = self.content[size:]
+            return chunk
 
-        # Simulate a filesystem permission failure for this file.
-        original_unlink = Path.unlink
+        def close(self):
+            pass
 
-        def failing_unlink(self, *args, **kwargs):
-            if self.resolve() == file_path.resolve():
-                raise PermissionError("Simulated file lock")
-            return original_unlink(self, *args, **kwargs)
+    monkeypatch.setattr(
+        documents_router,
+        "download_file",
+        lambda object_key: FakeFileBody(pdf_content),
+    )
 
-        monkeypatch.setattr(Path, "unlink", failing_unlink)
+    response = client.get(
+        f"/documents/{document_id}/file",
+        headers=headers,
+    )
 
-        document_service.delete_document(
-            db,
-            document_id,
-            document.owner,
+    assert response.status_code == 200
+    assert response.content == pdf_content
+    assert response.headers["content-type"] == "application/pdf"
+    assert "inline" in response.headers["content-disposition"]
+
+
+def test_user_cannot_download_another_users_document(client, monkeypatch):
+    from app.routers import documents as documents_router
+
+    owner_headers = register_and_login(
+        client,
+        "download-owner@example.com",
+        monkeypatch,
+    )
+
+    pdf_content = b"%PDF-1.4\nPrivate PDF content\n%%EOF"
+
+    upload_response = client.post(
+        "/documents/",
+        headers=owner_headers,
+        data={"title": "Private document"},
+        files={
+            "file": (
+                "private.pdf",
+                pdf_content,
+                "application/pdf",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+    document_id = upload_response.json()["id"]
+
+    other_user_headers = register_and_login(
+        client,
+        "download-other@example.com",
+        monkeypatch,
+    )
+
+    def unexpected_download(object_key):
+        raise AssertionError("B2 download must not be called")
+
+    monkeypatch.setattr(
+        documents_router,
+        "download_file",
+        unexpected_download,
+    )
+
+    response = client.get(
+        f"/documents/{document_id}/file",
+        headers=other_user_headers,
+    )
+
+    assert response.status_code == 404
+
+
+def test_download_returns_404_when_b2_file_missing(client, monkeypatch):
+    from botocore.exceptions import ClientError
+    from app.routers import documents as documents_router
+
+    headers = register_and_login(
+        client,
+        "missing-file@example.com",
+        monkeypatch,
+    )
+
+    pdf_content = b"%PDF-1.4\nTest PDF content\n%%EOF"
+
+    upload_response = client.post(
+        "/documents/",
+        headers=headers,
+        data={"title": "Missing file test"},
+        files={
+            "file": (
+                "missing.pdf",
+                pdf_content,
+                "application/pdf",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+    document_id = upload_response.json()["id"]
+
+    def missing_file(object_key):
+        raise ClientError(
+            {
+                "Error": {
+                    "Code": "NoSuchKey",
+                    "Message": "The specified key does not exist",
+                }
+            },
+            "GetObject",
         )
 
-        # The database record is gone, but the PDF remains.
-        assert db.query(Document).filter_by(id=document_id).first() is None
-        assert file_path.exists()
+    monkeypatch.setattr(
+        documents_router,
+        "download_file",
+        missing_file,
+    )
 
-        task = (
-            db.query(FileDeletionTask)
-            .filter_by(file_path=str(file_path))
-            .first()
-        )
+    response = client.get(
+        f"/documents/{document_id}/file",
+        headers=headers,
+    )
 
-        assert task is not None
-        assert task.attempts >= 1
-        assert "Simulated file lock" in task.last_error
-
-        # Restore normal file deletion and retry the task.
-        monkeypatch.setattr(Path, "unlink", original_unlink)
-
-        result = retry_file_deletions(db)
-
-        assert result == {"deleted": 1, "failed": 0}
-        assert not file_path.exists()
-
-        assert (
-            db.query(FileDeletionTask)
-            .filter_by(file_path=str(file_path))
-            .first()
-            is None
-        )
-
-    finally:
-        db.close()
+    assert response.status_code == 404
+    assert response.json()["detail"] == "PDF file not found"
 
 def test_password_reset_revokes_old_access_token(
     client,
@@ -633,3 +728,559 @@ def test_password_reset_revokes_old_access_token(
     # Old access token must now be rejected.
     response = client.get("/auth/me", headers=old_headers)
     assert response.status_code == 401
+
+
+def test_failed_file_deletion_can_be_retried(client, monkeypatch):
+    from app.services import document_service, file_cleanup_service
+
+    headers = register_and_login(
+        client,
+        "cleanup@example.com",
+        monkeypatch,
+    )
+
+    pdf_content = b"%PDF-1.4\nTest PDF content\n%%EOF"
+
+    response = client.post(
+        "/documents/",
+        headers=headers,
+        data={"title": "Cleanup test"},
+        files={
+            "file": (
+                "cleanup.pdf",
+                pdf_content,
+                "application/pdf",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    document_id = response.json()["id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        document = db.query(Document).filter_by(id=document_id).first()
+        assert document is not None
+
+        object_key = document.file_path
+        owner = document.owner
+
+        def failing_delete(object_key):
+            raise PermissionError("Simulated B2 deletion failure")
+
+        monkeypatch.setattr(document_service, "delete_file", failing_delete)
+
+        document_service.delete_document(db, document_id, owner)
+
+        assert db.query(Document).filter_by(id=document_id).first() is None
+
+        task = (
+            db.query(FileDeletionTask)
+            .filter_by(file_path=object_key)
+            .first()
+        )
+
+        assert task is not None
+        assert task.attempts >= 1
+        assert "Simulated B2 deletion failure" in task.last_error
+
+        deleted_objects = []
+
+        def successful_delete(object_key):
+            deleted_objects.append(object_key)
+
+        monkeypatch.setattr(
+            file_cleanup_service,
+            "delete_file",
+            successful_delete,
+        )
+
+        result = retry_file_deletions(db)
+
+        assert result == {"deleted": 1, "failed": 0}
+        assert deleted_objects == [object_key]
+
+        assert (
+            db.query(FileDeletionTask)
+            .filter_by(file_path=object_key)
+            .first()
+            is None
+        )
+
+    finally:
+        db.close()
+
+
+def test_list_documents_search_filter_sort_and_pagination(
+    client, monkeypatch
+):
+    headers = register_and_login(
+        client,
+        "listing@example.com",
+        monkeypatch,
+    )
+
+    # Create two subjects.
+    python_response = client.post(
+        "/subjects/",
+        json={"name": "Python"},
+        headers=headers,
+    )
+    assert python_response.status_code == 201
+    python_id = python_response.json()["id"]
+
+    sql_response = client.post(
+        "/subjects/",
+        json={"name": "SQL"},
+        headers=headers,
+    )
+    assert sql_response.status_code == 201
+    sql_id = sql_response.json()["id"]
+
+    # Upload three documents.
+    pdf = b"%PDF-1.4\nTest PDF content\n%%EOF"
+
+    documents = [
+        ("Python Basics", python_id),
+        ("Advanced Python", python_id),
+        ("SQL Basics", sql_id),
+    ]
+
+    for title, subject_id in documents:
+        response = client.post(
+            "/documents/",
+            headers=headers,
+            data={
+                "title": title,
+                "subject_id": str(subject_id),
+            },
+            files={
+                "file": (
+                    f"{title}.pdf",
+                    pdf,
+                    "application/pdf",
+                )
+            },
+        )
+        assert response.status_code == 201, response.json()
+
+    # 1. Search should return only matching documents.
+    response = client.get(
+        "/documents/?search=python",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+    assert all("Python" in doc["title"] for doc in response.json())
+
+    # 2. Subject filtering.
+    response = client.get(
+        f"/documents/?subject_id={sql_id}",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.json()[0]["title"] == "SQL Basics"
+
+    # 3. Ascending title sorting.
+    response = client.get(
+        "/documents/?sort_by=title&order=asc",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    titles = [doc["title"] for doc in response.json()]
+    assert titles == sorted(titles)
+
+    # 4. Descending title sorting.
+    response = client.get(
+        "/documents/?sort_by=title&order=desc",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    titles = [doc["title"] for doc in response.json()]
+    assert titles == sorted(titles, reverse=True)
+
+    # 5. Pagination and total matching count.
+    response = client.get(
+        "/documents/?limit=2&offset=0",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+    assert response.headers["X-Total-Count"] == "3"
+
+    response = client.get(
+        "/documents/?limit=2&offset=2",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.headers["X-Total-Count"] == "3"
+
+
+def test_list_documents_rejects_invalid_query_parameters(
+    client, monkeypatch
+):
+    headers = register_and_login(
+        client,
+        "invalid-params@example.com",
+        monkeypatch,
+    )
+
+    invalid_queries = [
+        "?sort_by=invalid",
+        "?order=random",
+        "?limit=0",
+        "?limit=101",
+        "?offset=-1",
+    ]
+
+    for query in invalid_queries:
+        response = client.get(
+            f"/documents/{query}",
+            headers=headers,
+        )
+
+        assert response.status_code == 422, (
+            f"Expected 422 for {query}, got {response.status_code}"
+        )
+
+def test_subject_crud_flow(client, monkeypatch):
+    headers = register_and_login(
+        client,
+        "subject-crud@example.com",
+        monkeypatch,
+    )
+
+    # Create
+    create_response = client.post(
+        "/subjects/",
+        headers=headers,
+        json={"name": "Python"},
+    )
+
+    assert create_response.status_code == 201
+    subject = create_response.json()
+    subject_id = subject["id"]
+    assert subject["name"] == "Python"
+
+    # List
+    list_response = client.get(
+        "/subjects/",
+        headers=headers,
+    )
+
+    assert list_response.status_code == 200
+    assert any(item["id"] == subject_id for item in list_response.json())
+
+    # Update
+    update_response = client.patch(
+        f"/subjects/{subject_id}",
+        headers=headers,
+        json={"name": "Advanced Python"},
+    )
+
+    assert update_response.status_code == 200
+    assert update_response.json()["name"] == "Advanced Python"
+
+    # Delete
+    delete_response = client.delete(
+        f"/subjects/{subject_id}",
+        headers=headers,
+    )
+
+    assert delete_response.status_code == 204
+
+    # Verify deletion
+    get_response = client.get(
+        "/subjects/",
+        headers=headers,
+    )
+
+    assert all(
+        item["id"] != subject_id
+        for item in get_response.json()
+    )
+
+def test_document_update_validation(client, monkeypatch):
+    headers = register_and_login(
+        client,
+        "document-update@example.com",
+        monkeypatch,
+    )
+
+    upload_response = client.post(
+        "/documents/",
+        headers=headers,
+        data={"title": "Original Title"},
+        files={
+            "file": (
+                "original.pdf",
+                b"%PDF-1.4 test content",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+    document_id = upload_response.json()["id"]
+
+    invalid_updates = [
+    ({"title": ""}, 422),
+    ({"title": "   "}, 422),
+    ({"title": None}, 400),
+    ({"unexpected_field": "value"}, 422),
+]
+
+    for payload, expected_status in invalid_updates:
+        response = client.patch(
+             f"/documents/{document_id}",
+             headers=headers,
+             json=payload,
+    )
+
+        assert response.status_code == expected_status, (
+            f"Expected {expected_status} for {payload}, "
+            f"got {response.status_code}"
+        )
+
+    get_response = client.get(
+        f"/documents/{document_id}",
+        headers=headers,
+    )
+
+    assert get_response.status_code == 200
+    assert get_response.json()["title"] == "Original Title"
+
+def test_document_delete_success(client, monkeypatch):
+    headers = register_and_login(
+        client,
+        "document-delete@example.com",
+        monkeypatch,
+    )
+
+    from app.services import document_service
+
+    uploaded_objects = []
+    deleted_objects = []
+
+    def fake_upload_file(file, object_key, content_type):
+        uploaded_objects.append(object_key)
+
+    def fake_delete_file(object_key):
+        deleted_objects.append(object_key)
+
+    monkeypatch.setattr(
+        document_service,
+        "upload_file",
+        fake_upload_file,
+    )
+    monkeypatch.setattr(
+        document_service,
+        "delete_file",
+        fake_delete_file,
+    )
+
+    upload_response = client.post(
+        "/documents/",
+        headers=headers,
+        data={"title": "Delete Me"},
+        files={
+            "file": (
+                "delete-me.pdf",
+                b"%PDF-1.4 test content",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    document_id = upload_response.json()["id"]
+    object_key = uploaded_objects[0]
+
+    # Delete document
+    delete_response = client.delete(
+        f"/documents/{document_id}",
+        headers=headers,
+    )
+
+    assert delete_response.status_code == 204
+
+    # Verify B2 deletion
+    assert deleted_objects == [object_key]
+
+    # Verify document no longer exists
+    get_response = client.get(
+        f"/documents/{document_id}",
+        headers=headers,
+    )
+
+    assert get_response.status_code == 404
+
+    # Verify cleanup task was removed after successful B2 deletion
+    from app.models.file_deletion_task import FileDeletionTask
+
+    with TestingSessionLocal() as db:
+        task = (
+            db.query(FileDeletionTask)
+            .filter(FileDeletionTask.file_path == object_key)
+            .first()
+        )
+
+        assert task is None
+
+def test_user_cannot_delete_another_users_document(client, monkeypatch):
+    from app.services import document_service
+
+    owner_headers = register_and_login(
+        client,
+        "document-owner@example.com",
+        monkeypatch,
+    )
+
+    other_user_headers = register_and_login(
+        client,
+        "document-other@example.com",
+        monkeypatch,
+    )
+
+    deleted_objects = []
+
+    def fake_upload_file(file, object_key, content_type):
+        pass
+
+    def fake_delete_file(object_key):
+        deleted_objects.append(object_key)
+
+    monkeypatch.setattr(
+        document_service,
+        "upload_file",
+        fake_upload_file,
+    )
+    monkeypatch.setattr(
+        document_service,
+        "delete_file",
+        fake_delete_file,
+    )
+
+    upload_response = client.post(
+        "/documents/",
+        headers=owner_headers,
+        data={"title": "Private Document"},
+        files={
+            "file": (
+                "private.pdf",
+                b"%PDF-1.4 test content",
+                "application/pdf",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+    document_id = upload_response.json()["id"]
+
+    # Another user attempts deletion.
+    delete_response = client.delete(
+        f"/documents/{document_id}",
+        headers=other_user_headers,
+    )
+
+    assert delete_response.status_code == 404
+
+    # B2 deletion must not be attempted.
+    assert deleted_objects == []
+
+    # Original owner must still access the document.
+    get_response = client.get(
+        f"/documents/{document_id}",
+        headers=owner_headers,
+    )
+
+    assert get_response.status_code == 200
+    assert get_response.json()["title"] == "Private Document"
+
+
+
+def test_failed_upload_cleanup_creates_deletion_task(client, monkeypatch):
+    from unittest.mock import patch
+    from fastapi import UploadFile
+    from io import BytesIO
+    from app.services import document_service
+
+    register_and_login(
+        client,
+        "orphan-cleanup@example.com",
+        monkeypatch,
+    )
+
+    uploaded_objects = []
+
+    def fake_upload(file_object, object_key, content_type):
+        uploaded_objects.append(object_key)
+
+    def failing_delete(object_key):
+        raise PermissionError("Simulated B2 cleanup failure")
+
+    monkeypatch.setattr(document_service, "upload_file", fake_upload)
+    monkeypatch.setattr(document_service, "delete_file", failing_delete)
+
+    db = TestingSessionLocal()
+
+    try:
+        original_commit = db.commit
+        commit_calls = 0
+
+        def commit_with_one_failure():
+            nonlocal commit_calls
+            commit_calls += 1
+
+            if commit_calls == 1:
+                raise RuntimeError("Simulated database failure")
+
+            original_commit()
+
+        with patch.object(
+            db,
+            "commit",
+            side_effect=commit_with_one_failure,
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="Simulated database failure",
+            ):
+                document_service.upload_document(
+                    db=db,
+                    current_user=db.query(User).filter_by(
+                        email="orphan-cleanup@example.com"
+                    ).first(),
+                    file=UploadFile(
+                        filename="orphan.pdf",
+                        file=BytesIO(
+                            b"%PDF-1.4\nTest PDF\n%%EOF"
+                        ),
+                    ),
+                    title="Orphan test",
+                    subject_id=None,
+                )
+
+        assert len(uploaded_objects) == 1
+        assert db.query(Document).count() == 0
+
+        task = db.query(FileDeletionTask).filter_by(
+            file_path=uploaded_objects[0]
+        ).first()
+
+        assert task is not None
+        assert task.attempts == 1
+        assert "Simulated B2 cleanup failure" in task.last_error
+
+    finally:
+        db.close()

@@ -11,3 +11,4 @@ resend
 pytest
 httpx
 alembic
+boto3

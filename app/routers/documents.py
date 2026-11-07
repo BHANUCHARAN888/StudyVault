@@ -1,7 +1,8 @@
 from typing import Annotated
-from pathlib import Path
-from fastapi.responses import FileResponse
+from urllib.parse import quote
 
+from botocore.exceptions import ClientError
+from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, Query, Response
 from sqlalchemy.orm import Session
 
@@ -16,6 +17,7 @@ from app.services.document_service import (
     update_document,
     upload_document,
 )
+from app.services.storage_service import download_file
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
@@ -81,19 +83,40 @@ def open_document_file(
             detail=str(exc),
         ) from exc
 
-    file_path = Path(document.file_path)
+    try:
+        file_body = download_file(document.file_path)
 
-    if not file_path.is_file():
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+
+        if error_code in ("NoSuchKey", "404", "NotFound"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PDF file not found",
+            ) from exc
+
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="PDF file not found",
-        )
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to retrieve PDF from storage",
+        ) from exc
 
-    return FileResponse(
-        path=file_path,
+    def stream_file():
+        try:
+            while chunk := file_body.read(1024 * 1024):
+                yield chunk
+        finally:
+            file_body.close()
+
+    filename = quote(document.original_filename)
+
+    return StreamingResponse(
+        stream_file(),
         media_type="application/pdf",
-        filename=document.original_filename,
-        content_disposition_type="inline",
+        headers={
+            "Content-Disposition": (
+                f"inline; filename*=UTF-8''{filename}"
+            )
+        },
     )
 
 @router.get("/{document_id}", response_model=DocumentResponse)

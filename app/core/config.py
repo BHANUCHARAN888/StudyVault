@@ -1,4 +1,3 @@
-
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,8 +26,13 @@ class Settings(BaseSettings):
 
     frontend_url: str = "http://localhost:5173"
 
-    storage_dir: str = "storage/documents"
     max_file_size_mb: int = 50
+    # Backblaze B2
+    b2_key_id: str | None = None
+    b2_application_key: SecretStr | None = None
+    b2_bucket_name: str | None = None
+    b2_endpoint_url: str | None = None
+    b2_region: str | None = None
 
     @field_validator("jwt_algorithm")
     @classmethod
@@ -61,16 +65,6 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
-
-    @property
-    def storage_path(self) -> Path:
-        path = Path(self.storage_dir)
-
-        if not path.is_absolute():
-            path = BASE_DIR / path
-
-        return path
-
 
 @lru_cache
 def get_settings() -> Settings:
