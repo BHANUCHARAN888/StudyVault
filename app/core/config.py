@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     smtp_app_password: SecretStr | None = None
     email_from: str | None = None
 
+    # Google Apps Script email relay
+    email_relay_url: str | None = None
+    email_relay_secret: SecretStr | None = None
+
     frontend_url: str = "http://localhost:5173"
 
     max_file_size_mb: int = 50
