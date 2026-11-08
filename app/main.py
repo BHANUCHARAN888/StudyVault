@@ -29,10 +29,10 @@ app.add_middleware(
     CORSMiddleware,
     expose_headers=["X-Total-Count"],
     allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://studyvault-5yrmffz8i-study-vault6.vercel.app",
-    ],
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://studyvault-4386ypgoh-study-vault6.vercel.app",
+],
     allow_credentials=False,
     allow_methods=[
         "GET",
