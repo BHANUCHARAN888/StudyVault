@@ -1,4 +1,6 @@
 import logging
+
+from sqlalchemy import exc
 logger = logging.getLogger(__name__)
 
 import smtplib
@@ -70,9 +72,9 @@ If you did not create this account, you can ignore this email.
             server.send_message(message)
 
     except (smtplib.SMTPException, OSError) as exc:
-        logger.exception("Failed to send email")
+        logger.exception("Failed to send verification email")
         raise RuntimeError(
-            "Unable to send email. Please try again later."
+            "Unable to send verification email. Please try again later."
         ) from exc
 
 def send_password_reset_email(
@@ -138,7 +140,7 @@ Your password will remain unchanged.
             server.send_message(message)
 
     except (smtplib.SMTPException, OSError) as exc:
-        logger.exception("Failed to send email")
-    raise RuntimeError(
-        "Unable to send email. Please try again later."
-    ) from exc
+        logger.exception("Failed to send password reset email")
+        raise RuntimeError(
+            "Unable to send password reset email. Please try again later."
+        ) from exc
